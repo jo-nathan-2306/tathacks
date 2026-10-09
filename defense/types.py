@@ -82,6 +82,9 @@ class AdversarialDetectionResult:
     attack_category: Optional[str] = None
     is_benign_context: bool = False
     details: Dict[str, Any] = field(default_factory=dict)
+    has_legitimate_query: bool = False
+    clean_query: str = ""
+    quarantined_segments: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -119,3 +122,4 @@ class ValidationResult:
     latency_ms: float = 0.0
     metrics: Dict[str, Any] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
+    corrections: List[str] = field(default_factory=list)

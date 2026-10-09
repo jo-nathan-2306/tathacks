@@ -56,7 +56,6 @@ class EvidenceVerifier:
 
             ev_keywords = self._extract_keywords(ev.content)
             ev_numbers = self._extract_numbers(ev.content)
-            ev_negated = self._has_negation(ev.content)
 
             overlap = claim_keywords.intersection(ev_keywords)
             if not overlap:
@@ -73,14 +72,35 @@ class EvidenceVerifier:
                 if not number_match and overlap_ratio >= 0.35:
                     contradiction_found = True
                     contradiction_source = ev.source_id
-                    suggested_correction = f"Evidence from {ev.source_id} contains {', '.join(sorted(list(ev_numbers)))} instead of {', '.join(sorted(list(claim_numbers)))}."
+                    suggested_correction = (
+                        f"Evidence from {ev.source_id} states: '{ev.content.strip()}' "
+                        f"(contains {', '.join(sorted(list(ev_numbers)))} instead of {', '.join(sorted(list(claim_numbers)))})."
+                    )
                     break
 
+            # Check sentence-level polarity for the best matching sentence
+            ev_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ev.content) if s.strip()]
+            best_s_overlap = 0.0
+            best_s_negated = self._has_negation(ev.content)
+            best_s_text = ev.content
+            for s in ev_sentences:
+                s_kw = self._extract_keywords(s)
+                if s_kw and claim_keywords:
+                    s_overlap = len(claim_keywords.intersection(s_kw)) / max(1, len(claim_keywords))
+                    if s_overlap > best_s_overlap:
+                        best_s_overlap = s_overlap
+                        best_s_negated = self._has_negation(s)
+                        best_s_text = s
+
             if overlap_ratio >= 0.5:
-                if claim_negated != ev_negated:
+                if (
+                    claim_negated != best_s_negated
+                    and (best_s_overlap >= 0.45 or len(ev_sentences) == 1)
+                    and not (claim_numbers and ev_numbers and bool(claim_numbers.intersection(ev_numbers)))
+                ):
                     contradiction_found = True
                     contradiction_source = ev.source_id
-                    suggested_correction = f"Evidence from {ev.source_id} contradicts polarity: '{ev.content.strip()}'."
+                    suggested_correction = f"Evidence from {ev.source_id} contradicts polarity: '{best_s_text.strip()}'."
                     break
                 else:
                     weighted_score = overlap_ratio * ev.quality_score

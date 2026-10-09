@@ -29,6 +29,41 @@ class InMemoryRetriever(EvidenceRetriever):
     def add_evidence(self, evidence: Evidence) -> None:
         self.documents.append(evidence)
 
+    @classmethod
+    def with_default_knowledge(cls) -> "InMemoryRetriever":
+        """Initializes an InMemoryRetriever preloaded with verified factual baselines."""
+        retriever = cls()
+        default_facts = [
+            Evidence(
+                source_id="official_docs",
+                content="Project Apollo was founded in 2021 by TechCorp and reached 50,000 active users in 2023.",
+                quality_score=1.0,
+            ),
+            Evidence(
+                source_id="verified_database",
+                content="Python was created by Guido van Rossum and was first released in 1991.",
+                quality_score=1.0,
+            ),
+            Evidence(
+                source_id="verified_database",
+                content="The Great Wall of China is located in northern China and spans over 21,000 kilometers.",
+                quality_score=1.0,
+            ),
+            Evidence(
+                source_id="internal_kb",
+                content="TechCorp Q3 revenue report: Net earnings grew 18% in 2023 with total revenue of $45 million.",
+                quality_score=1.0,
+            ),
+            Evidence(
+                source_id="verified_database",
+                content="There is no Nobel Prize in Mathematics; Alfred Nobel did not establish a prize for mathematics. The premier international mathematics prizes are the Fields Medal and the Abel Prize. Sir Andrew Wiles was awarded the Abel Prize in 2016 and an IMU Silver Plaque in 1998 for his proof of Fermat's Last Theorem, not a Nobel Prize.",
+                quality_score=1.0,
+            ),
+        ]
+        for f in default_facts:
+            retriever.add_evidence(f)
+        return retriever
+
     def _tokenize(self, text: str) -> Set[str]:
         words = re.findall(r"\b\w+\b", text.lower())
         return set(words)

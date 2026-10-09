@@ -39,20 +39,112 @@ class MockModelAdapter(ModelAdapter):
 class OllamaModelAdapter(ModelAdapter):
     def __init__(
         self,
-        model_name: str = "llama3",
+        model_name: str = "llama3.1",
         base_url: str = "http://localhost:11434",
         temperature: float = 0.7,
-        timeout: int = 60,
+        timeout: int = 120,
+        auto_resolve_model: bool = True,
     ) -> None:
-        self.model_name = model_name
+        self.raw_model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.temperature = temperature
         self.timeout = timeout
+        self.auto_resolve_model = auto_resolve_model
+        self.model_name = (
+            self.resolve_model_name(model_name)
+            if auto_resolve_model
+            else model_name
+        )
+
+    @staticmethod
+    def normalize_model_name(name: str) -> str:
+        """
+        Normalizes model name strings (e.g., 'llama 3.1b' -> 'llama3.1',
+        'llama-3.1' -> 'llama3.1').
+        """
+        import re
+
+        if not name:
+            return "llama3.1"
+        cleaned = name.strip().lower()
+        cleaned = re.sub(r"\s+", "", cleaned)
+        cleaned = cleaned.replace("-", "")
+        # Remove trailing 'b' following version numbers (e.g. '3.1b' -> '3.1')
+        cleaned = re.sub(r"(\d+\.?\d*)b$", r"\1", cleaned)
+        return cleaned
+
+    def list_installed_models(self) -> List[str]:
+        """Fetches the list of currently installed model tags from Ollama API."""
+        url = f"{self.base_url}/api/tags"
+        req = urllib.request.Request(
+            url, headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                res_json = json.loads(resp.read().decode("utf-8"))
+                models = res_json.get("models", [])
+                if isinstance(models, list):
+                    return [
+                        m.get("name", "")
+                        for m in models
+                        if isinstance(m, dict) and "name" in m
+                    ]
+                return []
+        except Exception:
+            return []
+
+    def is_server_running(self) -> bool:
+        """Checks if the Ollama local HTTP API is reachable and responding."""
+        url = f"{self.base_url}/api/tags"
+        req = urllib.request.Request(url)
+        try:
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def resolve_model_name(self, candidate_name: str) -> str:
+        """
+        Resolves model name aliases and tags against installed Ollama models.
+        Handles variations like 'llama 3.1b', 'llama3.1', and 'llama3.1:latest'.
+        """
+        normalized = self.normalize_model_name(candidate_name)
+        installed = self.list_installed_models()
+
+        if not installed:
+            return normalized
+
+        # 1. Exact match with tag
+        for m in installed:
+            if candidate_name.lower() == m.lower() or normalized == m.lower():
+                return m
+
+        # 2. Tag without :latest or base tag match
+        for m in installed:
+            base_tag = m.split(":")[0].lower()
+            if normalized == base_tag or candidate_name.lower() == base_tag:
+                return m
+
+        # 3. Sub-string / fuzzy match
+        for m in installed:
+            m_norm = self.normalize_model_name(m.split(":")[0])
+            if normalized in m_norm or m_norm in normalized:
+                return m
+
+        # 4. Fallback if single Llama model is installed
+        if len(installed) == 1 and normalized.startswith("llama"):
+            return installed[0]
+
+        return normalized
 
     def generate(self, prompt: str, **kwargs: Any) -> str:
         url = f"{self.base_url}/api/generate"
+        target_model = kwargs.get("model", self.model_name)
+        if self.auto_resolve_model and target_model != self.model_name:
+            target_model = self.resolve_model_name(target_model)
+
         payload = {
-            "model": kwargs.get("model", self.model_name),
+            "model": target_model,
             "prompt": prompt,
             "stream": False,
             "options": {
@@ -70,8 +162,26 @@ class OllamaModelAdapter(ModelAdapter):
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 res_json = json.loads(resp.read().decode("utf-8"))
                 return res_json.get("response", "")
+        except urllib.error.HTTPError as e:
+            err_detail = ""
+            try:
+                raw_body = e.read().decode("utf-8")
+                err_data = json.loads(raw_body)
+                if isinstance(err_data, dict) and "error" in err_data:
+                    err_detail = err_data["error"]
+                else:
+                    err_detail = raw_body
+            except Exception:
+                pass
+            msg = f"Ollama HTTP error {e.code} for model '{target_model}' at {url}"
+            if err_detail:
+                msg += f": {err_detail}"
+            raise RuntimeError(msg)
         except urllib.error.URLError as e:
-            raise RuntimeError(f"Failed to connect to Ollama at {url}: {str(e)}")
+            raise RuntimeError(
+                f"Failed to connect to Ollama at {url}. "
+                f"Ensure Ollama is running ('ollama serve'). Error: {str(e)}"
+            )
 
 
 class LocalOpenAICompatibleAdapter(ModelAdapter):

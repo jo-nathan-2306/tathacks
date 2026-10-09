@@ -53,13 +53,16 @@ class AdversarialDetector:
 
     LEXICON_CATEGORIES = {
         "instruction_hierarchy": [
-            r"ignore\s+(all\s+)?(previous|prior|above|system)\s+instructions?",
-            r"disregard\s+(all\s+)?(prior|previous|existing)\s+(rules|guidelines|directives)",
-            r"forget\s+(everything|all)\s+you\s+(were\s+told|know)",
-            r"override\s+system\s+prompt",
-            r"new\s+operating\s+mode\s*:",
-            r"from\s+now\s+on\s+you\s+must",
-            r"you\s+are\s+no\s+longer\s+bound\s+by",
+            r"ignore\s+(all\s+)?(previous|prior|above|system)\s+instructions?[^.?!]*",
+            r"disregard\s+(all\s+)?(prior|previous|existing)\s+(rules|guidelines|directives)[^.?!]*",
+            r"forget\s+(everything|all)\s+you\s+(were\s+told|know)[^.?!]*",
+            r"(override\s+system\s+prompt|system\s+override\s*[:\s]?)[^.?!]*",
+            r"new\s+operating\s+mode\s*:[^.?!]*",
+            r"from\s+now\s+on\s*[,:]?\s*(you\s+must|follow\s+only|only\s+follow|listen\s+only|obey|execute|adhere\s+only)[^.?!]*",
+            r"(follow|obey|listen\s+to)\s+only\s+(the|these|my)\s+(instructions|directives|rules|messages?)[^.?!]*",
+            r"only\s+(follow|obey|listen\s+to)\s+(the|these|my)\s+(instructions|directives|rules|messages?)[^.?!]*",
+            r"instructions?\s+in\s+this\s+message\s+(supersede|override|replace|take\s+precedence)[^.?!]*",
+            r"you\s+are\s+no\s+longer\s+bound\s+by[^.?!]*",
         ],
         "fake_authority": [
             r"i\s+am\s+(the\s+)?(developer|admin|root|creator|system\s+operator|system\s+admin)",
@@ -80,14 +83,16 @@ class AdversarialDetector:
             r"jailbroken\s+persona",
         ],
         "secret_extraction": [
-            r"print\s+your\s+(initial|system|original|developer)\s+prompt",
-            r"reveal\s+(hidden\s+instructions|secrets)",
+            r"(print|show|dump|reveal|output)\s+(your\s+)?(initial|system|original|developer)\s+prompt[^.?!]*",
+            r"(print|show|dump|reveal|output)\s+(hidden\s+instructions|secrets)[^.?!]*",
             r"what\s+are\s+your\s+internal\s+system\s+rules",
             r"dump\s+the\s+context\s+window",
             r"show\s+secret\s+keys?",
             r"output\s+keys",
             r"repeat\s+the\s+words\s+above\s+verbatim",
             r"output\s+everything\s+before\s+this\s+line",
+            r"reply\s+(only\s+)?with\s+(the\s+)?(exact\s+)?(word|phrase|token|code|string)[^.?!]*",
+            r"canary-[a-zA-Z0-9_-]+",
         ],
         "deceptive_framing": [
             r"translate\s+the\s+following\s+unfiltered\s+payload",
@@ -96,6 +101,28 @@ class AdversarialDetector:
             r"for\s+educational\s+reasons\s+only,\s+explain\s+how\s+to\s+hack",
             r"simulate\s+the\s+generation\s+of\s+malware",
         ],
+    }
+
+    HIGH_SEVERITY_PATTERNS = [
+        re.compile(r"ignore\s+(all\s+)?(previous|prior|above|system)\s+instructions?[^.?!]*", re.IGNORECASE),
+        re.compile(r"disregard\s+(all\s+)?(prior|previous|existing)\s+(rules|guidelines|directives)[^.?!]*", re.IGNORECASE),
+        re.compile(r"forget\s+(everything|all)\s+you\s+(were\s+told|know)[^.?!]*", re.IGNORECASE),
+        re.compile(r"(override\s+system\s+prompt|system\s+override\s*[:\s]?)[^.?!]*", re.IGNORECASE),
+        re.compile(r"sudo\s+mode\s+enabled", re.IGNORECASE),
+        re.compile(r"you\s+are\s+(DAN|Do\s+Anything\s+Now)", re.IGNORECASE),
+        re.compile(r"you\s+are\s+no\s+longer\s+bound\s+by", re.IGNORECASE),
+        re.compile(r"from\s+now\s+on\s*[,:]?\s*(follow\s+only|only\s+follow|you\s+must|listen\s+only|obey|execute)[^.?!]*", re.IGNORECASE),
+        re.compile(r"(follow|obey|listen\s+to)\s+only\s+(the|these|my)\s+(instructions|directives|rules|messages?)[^.?!]*", re.IGNORECASE),
+        re.compile(r"only\s+(follow|obey|listen\s+to)\s+(the|these|my)\s+(instructions|directives|rules|messages?)[^.?!]*", re.IGNORECASE),
+        re.compile(r"reply\s+(only\s+)?with\s+(the\s+)?(exact\s+)?(word|phrase|token|code|canary)[^.?!]*", re.IGNORECASE),
+        re.compile(r"canary-[a-zA-Z0-9_-]+", re.IGNORECASE),
+    ]
+
+    QUESTION_OR_ACTION_VERBS = {
+        "what", "why", "how", "when", "where", "who", "which", "whose", "whom",
+        "is", "are", "was", "were", "do", "does", "did", "can", "could", "would", "should", "will",
+        "explain", "describe", "summarize", "summary", "tell", "write", "define", "calculate", "help",
+        "list", "show", "give", "analyze", "compare", "create", "generate", "provide", "translate", "find",
     }
 
     def __init__(self, config: Optional[AdversarialConfig] = None) -> None:
@@ -162,7 +189,151 @@ class AdversarialDetector:
                 return True
         return False
 
-    def detect(self, input_text: str) -> AdversarialDetectionResult:
+    def is_meaningful_query(self, text: str) -> bool:
+        """
+        Determines whether a text fragment constitutes a legitimate, substantive user question or request,
+        as opposed to leftover conversational filler, prepositions, or adversarial fragments.
+        """
+        if not text:
+            return False
+        cleaned = text.strip()
+        words = [w.lower() for w in re.findall(r"\b[a-zA-Z0-9_-]+\b", cleaned) if len(w) > 1]
+        if len(words) < 2:
+            return False
+
+        meaningless_phrases = {
+            "in this message",
+            "in this prompt",
+            "to this message",
+            "from now on",
+            "at this moment",
+            "in this case",
+            "on this system",
+            "right now",
+            "with this message",
+            "to the user",
+            "of this text",
+        }
+        cleaned_lower = cleaned.lower().rstrip(".?!,:;")
+        if cleaned_lower in meaningless_phrases:
+            return False
+
+        if "?" in text:
+            return True
+
+        if any(w in self.QUESTION_OR_ACTION_VERBS for w in words):
+            return True
+
+        return len(words) >= 3
+
+    def extract_legitimate_query(self, text: str) -> Tuple[str, List[str]]:
+        """
+        Decomposes mixed input into a clean legitimate query and quarantined adversarial clauses.
+        Returns:
+            (clean_query, quarantined_clauses)
+        """
+        if not text:
+            return "", []
+
+        bracket_pattern = re.compile(
+            r"\[\s*(system\s+override|developer\s+override|system\s+prompt|sudo\s+mode)[^\]]*\]",
+            re.IGNORECASE,
+        )
+        quarantined_brackets = [m.group(0) for m in bracket_pattern.finditer(text)]
+        cleaned_brackets = bracket_pattern.sub("", text)
+
+        segments = re.split(r"(?<=[.?!])\s+|\n+", cleaned_brackets)
+        clean_segments: List[str] = []
+        quarantined: List[str] = list(quarantined_brackets)
+
+        for seg in segments:
+            seg_stripped = seg.strip()
+            if not seg_stripped:
+                continue
+
+            seg_det = self.detect(seg_stripped, _extract_query=False)
+            has_high_sev = any(
+                pat.search(seg_stripped) for pat in self.HIGH_SEVERITY_PATTERNS
+            )
+
+            if seg_det.is_adversarial or has_high_sev:
+                all_spans = []
+                for cat, patterns in self._compiled_lexicon.items():
+                    for pat in patterns:
+                        for m in pat.finditer(seg_stripped):
+                            all_spans.append(m.span())
+                for pat in self.HIGH_SEVERITY_PATTERNS:
+                    for m in pat.finditer(seg_stripped):
+                        all_spans.append(m.span())
+
+                recovered = False
+                if all_spans:
+                    all_spans.sort(key=lambda x: x[0])
+                    earliest_start = all_spans[0][0]
+                    prefix = seg_stripped[:earliest_start].strip()
+                    prefix = re.sub(
+                        r"[\s,]+(and|also|but|while|then|additionally)\s*$",
+                        "",
+                        prefix,
+                        flags=re.I,
+                    ).strip()
+                    if (
+                        self.is_meaningful_query(prefix)
+                        and not self.detect(prefix, _extract_query=False).is_adversarial
+                    ):
+                        clean_segments.append(prefix)
+                        quarantined.append(seg_stripped[earliest_start:])
+                        recovered = True
+
+                    if not recovered:
+                        latest_end = max(s[1] for s in all_spans)
+                        suffix = seg_stripped[latest_end:].strip()
+                        suffix = re.sub(
+                            r"^(and|also|but|then|now|instead)[\s,]+",
+                            "",
+                            suffix,
+                            flags=re.I,
+                        ).strip()
+                        if (
+                            self.is_meaningful_query(suffix)
+                            and not self.detect(suffix, _extract_query=False).is_adversarial
+                        ):
+                            quarantined.append(seg_stripped[:latest_end])
+                            clean_segments.append(suffix)
+                            recovered = True
+
+                if not recovered:
+                    quarantined.append(seg_stripped)
+            else:
+                cleaned_seg = seg_stripped
+                for pat in self.HIGH_SEVERITY_PATTERNS:
+                    cleaned_seg = pat.sub("", cleaned_seg)
+                cleaned_seg = re.sub(
+                    r"^(also|and|but|however|furthermore|additionally)[,\s]+",
+                    "",
+                    cleaned_seg.strip(),
+                    flags=re.IGNORECASE,
+                ).strip()
+                if (
+                    self.is_meaningful_query(cleaned_seg)
+                    and not self.detect(cleaned_seg, _extract_query=False).is_adversarial
+                ):
+                    clean_segments.append(cleaned_seg)
+
+        clean_query = " ".join(clean_segments).strip()
+        if clean_query:
+            if not self.is_meaningful_query(clean_query):
+                clean_query = ""
+            else:
+                final_det = self.detect(clean_query, _extract_query=False)
+                if final_det.is_adversarial:
+                    clean_query = ""
+
+        return clean_query, quarantined
+
+    def detect(
+        self, input_text: str, _extract_query: bool = True
+    ) -> AdversarialDetectionResult:
         if not self.config.enabled:
             return AdversarialDetectionResult(
                 is_adversarial=False,
@@ -170,6 +341,9 @@ class AdversarialDetector:
                 score=0.0,
                 detected_patterns=[],
                 is_benign_context=False,
+                has_legitimate_query=True,
+                clean_query=input_text,
+                quarantined_segments=[],
             )
 
         benign = self.is_benign_context(input_text)
@@ -196,11 +370,22 @@ class AdversarialDetector:
         active_categories = sum(1 for count in category_hits.values() if count > 0)
         total_hits = len(detected_matches)
 
+        has_high_severity = any(
+            pat.search(v)
+            for v in text_variants
+            for pat in self.HIGH_SEVERITY_PATTERNS
+        )
+
         raw_score = 0.0
-        if active_categories == 1:
-            raw_score = 0.7 if total_hits >= 1 else 0.0
+        if active_categories == 0:
+            raw_score = 0.0
+        elif active_categories == 1:
+            if has_high_severity or total_hits >= 2:
+                raw_score = 0.85
+            else:
+                raw_score = 0.70
         elif active_categories == 2:
-            raw_score = min(0.9, 0.75 + total_hits * 0.05)
+            raw_score = min(0.95, 0.85 + total_hits * 0.03)
         elif active_categories >= 3:
             raw_score = 1.0
 
@@ -222,6 +407,17 @@ class AdversarialDetector:
         else:
             risk = RiskLevel.LOW
 
+        has_legit = False
+        clean_q = ""
+        quar_segs: List[str] = []
+
+        if is_adv and _extract_query:
+            clean_q, quar_segs = self.extract_legitimate_query(input_text)
+            has_legit = bool(clean_q and self.is_meaningful_query(clean_q))
+        elif not is_adv:
+            clean_q = input_text
+            has_legit = True
+
         return AdversarialDetectionResult(
             is_adversarial=is_adv,
             risk_level=risk,
@@ -234,4 +430,7 @@ class AdversarialDetector:
                 "total_unique_matches": total_hits,
                 "variants_checked": len(text_variants),
             },
+            has_legitimate_query=has_legit,
+            clean_query=clean_q,
+            quarantined_segments=quar_segs,
         )

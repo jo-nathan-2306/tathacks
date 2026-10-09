@@ -14,14 +14,20 @@ class TrustBoundaryManager:
     }
 
     OVERRIDE_INJECTION_PATTERNS = [
-        re.compile(r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions", re.IGNORECASE),
+        re.compile(r"ignore\s+(all\s+)?(previous|prior|above|system)\s+instructions?", re.IGNORECASE),
         re.compile(r"disregard\s+(all\s+)?(previous|prior|system)\s+rules", re.IGNORECASE),
+        re.compile(r"forget\s+(everything|all)\s+you\s+(were\s+told|know)", re.IGNORECASE),
         re.compile(r"system\s*:\s*you\s+are\s+now", re.IGNORECASE),
         re.compile(r"<\s*\|?im_start\|?\s*>system", re.IGNORECASE),
         re.compile(r"\[\s*system\s*override\s*\]", re.IGNORECASE),
         re.compile(r"administrative\s+override\s*:", re.IGNORECASE),
         re.compile(r"new\s+system\s+prompt\s*:", re.IGNORECASE),
         re.compile(r"you\s+must\s+act\s+as\s+a\s+root\s+user", re.IGNORECASE),
+        re.compile(r"from\s+now\s+on\s*[,:]?\s*(follow\s+only|only\s+follow|you\s+must|listen\s+only|obey|execute)", re.IGNORECASE),
+        re.compile(r"(follow|obey|listen\s+to)\s+only\s+(the|these|my)\s+(instructions|directives|rules|messages?)", re.IGNORECASE),
+        re.compile(r"only\s+(follow|obey|listen\s+to)\s+(the|these|my)\s+(instructions|directives|rules|messages?)", re.IGNORECASE),
+        re.compile(r"reply\s+(only\s+)?with\s+(the\s+)?(exact\s+)?(word|phrase|token|code|canary)", re.IGNORECASE),
+        re.compile(r"canary-[a-zA-Z0-9_-]+", re.IGNORECASE),
     ]
 
     def __init__(self) -> None:
