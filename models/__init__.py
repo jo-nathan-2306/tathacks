@@ -1,3 +1,15 @@
-from models.base import CallableModelAdapter, MockModelAdapter, ModelAdapter
+from models.base import (
+    CallableModelAdapter,
+    LocalOpenAICompatibleAdapter,
+    MockModelAdapter,
+    ModelAdapter,
+    OllamaModelAdapter,
+)
 
-__all__ = ["CallableModelAdapter", "MockModelAdapter", "ModelAdapter"]
+__all__ = [
+    "CallableModelAdapter",
+    "LocalOpenAICompatibleAdapter",
+    "MockModelAdapter",
+    "ModelAdapter",
+    "OllamaModelAdapter",
+]
