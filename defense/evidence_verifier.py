@@ -24,8 +24,14 @@ class EvidenceVerifier:
         words = re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
         stopwords = {
             "the", "and", "that", "this", "with", "from", "for", "have",
-            "has", "had", "are", "were", "been", "will", "would", "should",
-            "could", "about", "which", "their", "there", "what", "when", "where",
+            "has", "had", "are", "were", "was", "is", "am", "be", "been",
+            "being", "will", "would", "should", "could", "do", "does", "did",
+            "about", "which", "their", "there", "what", "when", "where", "who",
+            "why", "how", "whose", "whom", "its", "they", "them", "then",
+            "than", "into", "onto", "upon", "your", "you", "our", "out", "not",
+            "but", "can", "just", "also", "all", "any", "each", "some", "such",
+            "other", "more", "most", "only", "own", "same", "very", "too", "per",
+            "a", "an", "of", "to", "on", "in", "at", "by", "as", "or", "if",
         }
         return set(w for w in words if w not in stopwords)
 

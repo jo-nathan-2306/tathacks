@@ -1,4 +1,4 @@
-"""
+﻿"""
 FastAPI Web Application for LLM Defensive Safety & Reliability Layer.
 Provides an interactive Chat UI, Live Defense Inspector, Preset Threat Scenarios,
 Knowledge Base Management, Tool Execution Sandbox, and Real-time Audit Observability.
@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -41,6 +42,7 @@ from defense.types import (
     VerificationStatus,
 )
 from models.base import LocalOpenAICompatibleAdapter, MockModelAdapter, OllamaModelAdapter
+from models.nvidia_nim import NvidiaNimAdapter, NVIDIA_NEMOTRON_MODEL
 from models.tinyfish import TinyFishSearchAdapter
 
 app = FastAPI(
@@ -50,6 +52,24 @@ app = FastAPI(
 )
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 load_dotenv(Path(__file__).resolve().parent / ".env")
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Apply browser-side defense-in-depth to every response."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; "
+        "base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+    )
+    return response
+
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
 # Shared in-memory knowledge base and pipeline instance
@@ -90,13 +110,18 @@ for fact in default_facts:
 # Initialize model adapter with fallback
 ollama_adapter = OllamaModelAdapter(
     model_name="llama3.1",
-    timeout=35,
-    num_predict=160,
+    # Keep local replies concise for latency, with enough headroom to avoid
+    # cutting off a short explanation mid-sentence.
+    timeout=45,
+    num_predict=64,
     keep_alive="10m",
     auto_resolve_model=True,
 )
 ollama_is_available = ollama_adapter.is_server_running()
-if os.getenv("TINYFISH_API_KEY", "").strip() and ollama_is_available:
+if os.getenv("NVIDIA_API_KEY", "").strip():
+    pipeline_model = NvidiaNimAdapter()
+    model_status = f"NVIDIA NIM ({pipeline_model.model_name})"
+elif os.getenv("TINYFISH_API_KEY", "").strip() and ollama_is_available:
     pipeline_model = TinyFishSearchAdapter(ollama_adapter)
     model_status = f"TinyFish Search + {ollama_adapter.model_name}"
 elif os.getenv("TINYFISH_API_KEY", "").strip():
@@ -121,7 +146,14 @@ shared_pipeline = DefensivePipeline(
     config=PipelineConfig(retries=RetryConfig(max_retries=1)),
 )
 model_lock = threading.RLock()
-model_provider = "tinyfish-standalone" if isinstance(pipeline_model, TinyFishSearchAdapter) and pipeline_model.model is None else ("tinyfish" if isinstance(pipeline_model, TinyFishSearchAdapter) else ("ollama" if isinstance(pipeline_model, OllamaModelAdapter) else "demo"))
+model_provider = (
+    "tinyfish-standalone"
+    if isinstance(pipeline_model, TinyFishSearchAdapter) and pipeline_model.model is None
+    else "tinyfish" if isinstance(pipeline_model, TinyFishSearchAdapter)
+    else "nvidia-nim" if isinstance(pipeline_model, NvidiaNimAdapter)
+    else "ollama" if isinstance(pipeline_model, OllamaModelAdapter)
+    else "demo"
+)
 last_chat_model = pipeline_model.model if isinstance(pipeline_model, TinyFishSearchAdapter) and pipeline_model.model is not None else (ollama_adapter if isinstance(pipeline_model, TinyFishSearchAdapter) else pipeline_model)
 
 
@@ -137,10 +169,17 @@ def current_model_info():
 
 
 def _model_info(model):
+    if isinstance(model, NvidiaNimAdapter):
+        return {
+            "provider": "nvidia-nim",
+            "model": model.model_name,
+            "base_url": model.base_url,
+            "backend": f"NVIDIA NIM Â· {model.model_name}",
+        }
     if isinstance(model, OllamaModelAdapter):
-        return {"provider": "ollama", "model": model.model_name, "base_url": model.base_url, "backend": f"Ollama Â· {model.model_name}"}
+        return {"provider": "ollama", "model": model.model_name, "base_url": model.base_url, "backend": f"Ollama Ã‚Â· {model.model_name}"}
     if isinstance(model, LocalOpenAICompatibleAdapter):
-        return {"provider": "openai-compatible", "model": model.model_name, "base_url": model.base_url, "backend": f"OpenAI-compatible Â· {model.model_name}"}
+        return {"provider": "openai-compatible", "model": model.model_name, "base_url": model.base_url, "backend": f"OpenAI-compatible Ã‚Â· {model.model_name}"}
     return {"provider": "demo", "model": "demo", "base_url": "", "backend": "Demo model"}
 
 
@@ -154,7 +193,7 @@ class ChatRequest(BaseModel):
 
 
 class ModelConfigRequest(BaseModel):
-    provider: str = Field(..., pattern="^(ollama|openai-compatible|demo|tinyfish|tinyfish-standalone)$")
+    provider: str = Field(..., pattern="^(ollama|openai-compatible|nvidia-nim|demo|tinyfish|tinyfish-standalone)$")
     model: str = Field(default="llama3.1", min_length=1, max_length=160)
     base_url: str = Field(default="http://localhost:11434", max_length=500)
     api_key: str = Field(default="", max_length=2000)
@@ -178,23 +217,24 @@ async def set_model_config(req: ModelConfigRequest):
     if not model_name:
         raise HTTPException(status_code=400, detail="Model name is required")
     if req.provider == "ollama":
-        base_url = req.base_url.strip().rstrip("/") or "http://localhost:11434"
+        base_url = req.base_url.strip() or "http://localhost:11434"
         try:
-            candidate = OllamaModelAdapter(model_name=model_name, base_url=base_url, timeout=35, num_predict=160, keep_alive="10m")
+            candidate = OllamaModelAdapter(model_name=model_name, base_url=base_url, timeout=45, num_predict=64, keep_alive="10m")
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid Ollama settings: {exc}")
         if not candidate.is_server_running():
             raise HTTPException(status_code=400, detail="Ollama is not reachable at that address. Start Ollama and check the URL.")
         new_model = candidate
-        label = f"Ollama Â· {candidate.model_name}"
+        label = f"Ollama Ã‚Â· {candidate.model_name}"
+    elif req.provider == "nvidia-nim":
+        try:
+            new_model = NvidiaNimAdapter(model_name=NVIDIA_NEMOTRON_MODEL)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        label = f"NVIDIA NIM Â· {new_model.model_name}"
     elif req.provider == "openai-compatible":
-        base_url = req.base_url.strip().rstrip("/")
-        if not base_url.startswith(("https://", "http://")):
-            raise HTTPException(status_code=400, detail="Endpoint must begin with http:// or https://")
-        if not base_url or any(ch.isspace() for ch in base_url):
-            raise HTTPException(status_code=400, detail="Enter a valid OpenAI-compatible API base URL")
-        new_model = LocalOpenAICompatibleAdapter(base_url=base_url, model_name=model_name, api_key=req.api_key, timeout=90)
-        label = f"OpenAI-compatible Â· {model_name}"
+        new_model = LocalOpenAICompatibleAdapter(base_url=req.base_url, model_name=model_name, api_key=req.api_key, timeout=90)
+        label = f"OpenAI-compatible Ã‚Â· {model_name}"
     elif req.provider == "tinyfish":
         with model_lock:
             active_model = shared_pipeline.model
@@ -220,7 +260,7 @@ async def set_model_config(req: ModelConfigRequest):
         shared_pipeline.model = new_model
         model_provider = req.provider
         model_status = label
-        if req.provider in {"ollama", "openai-compatible", "demo"}:
+        if req.provider in {"ollama", "openai-compatible", "nvidia-nim", "demo"}:
             last_chat_model = new_model
     return {"status": "updated", "provider": req.provider, "model": model_name if req.provider != "demo" else "demo", "backend": label}
 
@@ -232,7 +272,7 @@ class KnowledgeBaseItem(BaseModel):
 
 
 class ToolValidateRequest(BaseModel):
-    tool_name: str
+    tool_name: str = Field(..., min_length=1, max_length=120)
     arguments: Dict[str, Any]
     caller_boundary: str = "USER"
     is_sensitive: bool = False
@@ -296,7 +336,10 @@ async def chat_endpoint(req: ChatRequest, request: Request = None):
                 setattr(request_pipeline.config.modules, k, bool(v))
 
     client_id = request.client.host if request and request.client else "web_user"
-    result = request_pipeline.run(
+    # Generation is synchronous for current adapters. Offload the full pipeline
+    # so a slow local model cannot stall health checks and other web requests.
+    result = await run_in_threadpool(
+        request_pipeline.run,
         user_input=req.message,
         # This field comes from the browser/API caller, so it must never be
         # promoted to a trusted system instruction.
@@ -305,6 +348,10 @@ async def chat_endpoint(req: ChatRequest, request: Request = None):
         memory_context=safe_boundary_memory or None,
         client_id=client_id,
     )
+    safe_errors = [
+        request_pipeline.privacy_sanitizer.mask_text(str(error))[:500]
+        for error in result.errors[:8]
+    ]
     web_sources = request_pipeline.model.last_sources if isinstance(request_pipeline.model, TinyFishSearchAdapter) else []
     provider_error = (
         request_pipeline.privacy_sanitizer.mask_text(
@@ -331,9 +378,9 @@ async def chat_endpoint(req: ChatRequest, request: Request = None):
         else f"TinyFish Search + {_model_info(request_pipeline.model.model)['model']}"
         if isinstance(request_pipeline.model, TinyFishSearchAdapter)
         else
-        f"Ollama Â· {request_pipeline.model.model_name}"
+        f"Ollama Ã‚Â· {request_pipeline.model.model_name}"
         if isinstance(request_pipeline.model, OllamaModelAdapter)
-        else f"OpenAI-compatible Â· {request_pipeline.model.model_name}"
+        else f"{request_pipeline.model.provider_label} Â· {request_pipeline.model.model_name}"
         if isinstance(request_pipeline.model, LocalOpenAICompatibleAdapter)
         else "Demo model"
     )
@@ -460,7 +507,7 @@ async def chat_endpoint(req: ChatRequest, request: Request = None):
         "assertions": assertions_data,
         "adversarial_details": adv_data,
         "metrics": result.metrics,
-        "errors": result.errors,
+        "errors": safe_errors,
         "pipeline_trace": pipeline_trace,
     }
 
@@ -1515,7 +1562,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   <!-- Top Navigation Header -->
   <header>
     <a href="#" class="brand">
-      <div class="brand-icon">ðŸ›¡ï¸</div>
+      <div class="brand-icon">Ã°Å¸â€ºÂ¡Ã¯Â¸Â</div>
       <div class="brand-text">
         <h1>AegisGuard AI</h1>
         <span>Defensive Safety & Reliability Layer</span>
@@ -1523,12 +1570,12 @@ HTML_CONTENT = """<!DOCTYPE html>
     </a>
 
     <nav class="nav-tabs">
-      <button class="nav-tab active" onclick="switchTab('chat')">ðŸ’¬ Live Chat</button>
-      <button class="nav-tab" onclick="switchTab('presets')">ðŸ”¬ Threat Presets</button>
-      <button class="nav-tab" onclick="switchTab('knowledge')">ðŸ“š Knowledge Base</button>
-      <button class="nav-tab" onclick="switchTab('tools')">ðŸ› ï¸ Tool Sandbox</button>
-      <button class="nav-tab" onclick="switchTab('audit')">ðŸ“Š Telemetry & Audit</button>
-      <button class="nav-tab" onclick="switchTab('config')">âš™ï¸ Config</button>
+      <button class="nav-tab active" onclick="switchTab('chat')">Ã°Å¸â€™Â¬ Live Chat</button>
+      <button class="nav-tab" onclick="switchTab('presets')">Ã°Å¸â€Â¬ Threat Presets</button>
+      <button class="nav-tab" onclick="switchTab('knowledge')">Ã°Å¸â€œÅ¡ Knowledge Base</button>
+      <button class="nav-tab" onclick="switchTab('tools')">Ã°Å¸â€ºÂ Ã¯Â¸Â Tool Sandbox</button>
+      <button class="nav-tab" onclick="switchTab('audit')">Ã°Å¸â€œÅ  Telemetry & Audit</button>
+      <button class="nav-tab" onclick="switchTab('config')">Ã¢Å¡â„¢Ã¯Â¸Â Config</button>
     </nav>
 
     <div class="status-badge" id="backendStatus">
@@ -1547,21 +1594,21 @@ HTML_CONTENT = """<!DOCTYPE html>
         <!-- Chat Stream Box -->
         <div class="chat-container">
           <div class="chat-header">
-            <h2>ðŸ’¬ Secure AI Conversation Stream</h2>
-            <button class="btn-inspect" onclick="clearChat()">ðŸ—‘ï¸ Clear History</button>
+            <h2>Ã°Å¸â€™Â¬ Secure AI Conversation Stream</h2>
+            <button class="btn-inspect" onclick="clearChat()">Ã°Å¸â€”â€˜Ã¯Â¸Â Clear History</button>
           </div>
 
           <div class="chat-messages" id="chatMessages">
             <div class="message assistant">
               <div class="message-meta">
-                <span>ðŸ›¡ï¸ AegisGuard AI Defense</span>
-                <span>â€¢ Just now</span>
+                <span>Ã°Å¸â€ºÂ¡Ã¯Â¸Â AegisGuard AI Defense</span>
+                <span>Ã¢â‚¬Â¢ Just now</span>
               </div>
               <div class="message-bubble">
                 Welcome to <strong>AegisGuard AI</strong>. Every message sent here is actively analyzed and protected against
                 <strong>Prompt Injections, Jailbreaks, Factual Hallucinations, Data Leakage, and Dangerous Tool Execution</strong>.
                 <br><br>
-                Try typing a prompt, or click <strong>ðŸ”¬ Threat Presets</strong> in the top menu to run one-click security benchmarks!
+                Try typing a prompt, or click <strong>Ã°Å¸â€Â¬ Threat Presets</strong> in the top menu to run one-click security benchmarks!
               </div>
             </div>
           </div>
@@ -1570,7 +1617,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             <div class="input-row">
               <input type="text" id="userInput" class="chat-input" placeholder="Enter message, fact query, or adversarial test..." onkeydown="handleKeyPress(event)" />
               <button id="sendBtn" class="btn-send" onclick="sendMessage()">
-                <span>Send</span> âž”
+                <span>Send</span> Ã¢Å¾â€
               </button>
             </div>
           </div>
@@ -1579,7 +1626,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <!-- Live Step Inspector Side Panel -->
         <div class="inspector-panel">
           <div class="panel-header">
-            <h3>ðŸ”¬ Pipeline Live Inspector</h3>
+            <h3>Ã°Å¸â€Â¬ Pipeline Live Inspector</h3>
             <span style="font-size: 0.72rem; color: var(--text-dim);">8-Tier Architecture</span>
           </div>
 
@@ -1649,7 +1696,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <!-- TAB 2: Threat & Safety Presets -->
     <section id="tab-presets" class="tab-content">
       <div>
-        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">ðŸ”¬ Interactive Threat & Safety Benchmarks</h2>
+        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">Ã°Å¸â€Â¬ Interactive Threat & Safety Benchmarks</h2>
         <p style="color: var(--text-muted); font-size: 0.85rem;">One-click real-world attack benchmarks to evaluate how the AI Defense Layer handles diverse risk vectors.</p>
       </div>
 
@@ -1662,7 +1709,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <section id="tab-knowledge" class="tab-content">
       <div style="display: flex; justify-content: space-between; align-items: flex-end;">
         <div>
-          <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">ðŸ“š Verified Factual Knowledge Base</h2>
+          <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">Ã°Å¸â€œÅ¡ Verified Factual Knowledge Base</h2>
           <p style="color: var(--text-muted); font-size: 0.85rem;">Ground-truth factual database used by the Bi-Directional Hallucination Mitigation Layer to verify claims.</p>
         </div>
         <button class="btn-send" onclick="openAddFactModal()">+ Add Verified Fact</button>
@@ -1689,7 +1736,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <!-- TAB 4: Tool Execution Sandbox -->
     <section id="tab-tools" class="tab-content">
       <div>
-        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">ðŸ› ï¸ Agent Tool Sandboxing & Permission Validator</h2>
+        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">Ã°Å¸â€ºÂ Ã¯Â¸Â Agent Tool Sandboxing & Permission Validator</h2>
         <p style="color: var(--text-muted); font-size: 0.85rem;">Validates tool calls for parameter sanitization, shell command injection, path traversal, and human authorization checks.</p>
       </div>
 
@@ -1733,7 +1780,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <!-- TAB 5: Telemetry & Audit Logs -->
     <section id="tab-audit" class="tab-content">
       <div>
-        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">ðŸ“Š Real-time Safety Telemetry & Audit Ledger</h2>
+        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">Ã°Å¸â€œÅ  Real-time Safety Telemetry & Audit Ledger</h2>
         <p style="color: var(--text-muted); font-size: 0.85rem;">Tamper-evident append-only telemetry logging all safety decisions, risk scores, and latency metrics.</p>
       </div>
 
@@ -1788,7 +1835,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <!-- TAB 6: Defense Configuration -->
     <section id="tab-config" class="tab-content">
       <div>
-        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">âš™ï¸ Defense Layer Configuration & Toggles</h2>
+        <h2 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.35rem;">Ã¢Å¡â„¢Ã¯Â¸Â Defense Layer Configuration & Toggles</h2>
         <p style="color: var(--text-muted); font-size: 0.85rem;">Dynamically enable or disable specific safety modules to observe behavior with vs without defense.</p>
       </div>
 
@@ -1850,7 +1897,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="modal-content">
       <div class="modal-header">
         <h3 style="font-size: 1.05rem; font-weight: 700;">Add Verified Ground-Truth Fact</h3>
-        <button class="btn-close" onclick="closeAddFactModal()">âœ•</button>
+        <button class="btn-close" onclick="closeAddFactModal()">Ã¢Å“â€¢</button>
       </div>
       <div class="modal-body">
         <div class="form-group">
@@ -1934,7 +1981,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         appendMessage('assistant', 'Error communicating with defense pipeline: ' + err.message);
       } finally {
         sendBtn.disabled = false;
-        sendBtn.innerHTML = '<span>Send</span> âž”';
+        sendBtn.innerHTML = '<span>Send</span> Ã¢Å¾â€';
       }
     }
 
@@ -1954,7 +2001,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       const metaDiv = document.createElement('div');
       metaDiv.className = 'message-meta';
-      metaDiv.innerHTML = role === 'user' ? '<span>You</span> â€¢ Just now' : '<span>ðŸ›¡ï¸ AegisGuard AI Defense</span> â€¢ Just now';
+      metaDiv.innerHTML = role === 'user' ? '<span>You</span> Ã¢â‚¬Â¢ Just now' : '<span>Ã°Å¸â€ºÂ¡Ã¯Â¸Â AegisGuard AI Defense</span> Ã¢â‚¬Â¢ Just now';
 
       const bubbleDiv = document.createElement('div');
       bubbleDiv.className = 'message-bubble';
@@ -2015,15 +2062,15 @@ HTML_CONTENT = """<!DOCTYPE html>
       if (!text) return '';
       return escapeHtml(text)
         .replace(/\n/g, '<br>')
-        .replace(/\\[Security Notice:(.*?)\\]/g, '<div style="margin-top:0.6rem; padding:0.5rem 0.75rem; background:rgba(59,130,246,0.12); border:1px solid rgba(59,130,246,0.3); border-radius:6px; color:#93C5FD; font-size:0.8rem;"><strong>ðŸ›¡ï¸ Security Notice:</strong> $1</div>')
-        .replace(/\\[Factual Correction:(.*?)\\]/g, '<div style="margin-top:0.6rem; padding:0.5rem 0.75rem; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.3); border-radius:6px; color:#FDE68A; font-size:0.8rem;"><strong>âš ï¸ Factual Correction:</strong> $1</div>')
+        .replace(/\\[Security Notice:(.*?)\\]/g, '<div style="margin-top:0.6rem; padding:0.5rem 0.75rem; background:rgba(59,130,246,0.12); border:1px solid rgba(59,130,246,0.3); border-radius:6px; color:#93C5FD; font-size:0.8rem;"><strong>Ã°Å¸â€ºÂ¡Ã¯Â¸Â Security Notice:</strong> $1</div>')
+        .replace(/\\[Factual Correction:(.*?)\\]/g, '<div style="margin-top:0.6rem; padding:0.5rem 0.75rem; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.3); border-radius:6px; color:#FDE68A; font-size:0.8rem;"><strong>Ã¢Å¡Â Ã¯Â¸Â Factual Correction:</strong> $1</div>')
         .replace(/\\[Content removed: (.*?)\\]/g, '<span style="background:rgba(239,68,68,0.25); color:#FCA5A5; padding:0.1rem 0.4rem; border-radius:4px; font-size:0.75rem; font-weight:700;">[REDACTED: $1]</span>');
     }
 
     function clearChat() {
       document.getElementById('chatMessages').innerHTML = `
         <div class="message assistant">
-          <div class="message-meta"><span>ðŸ›¡ï¸ AegisGuard AI Defense</span> â€¢ Just now</div>
+          <div class="message-meta"><span>Ã°Å¸â€ºÂ¡Ã¯Â¸Â AegisGuard AI Defense</span> Ã¢â‚¬Â¢ Just now</div>
           <div class="message-bubble">Conversation cleared. All defense modules active.</div>
         </div>`;
     }
@@ -2069,7 +2116,7 @@ HTML_CONTENT = """<!DOCTYPE html>
               <div class="preset-prompt">${escapeHtml(p.prompt || JSON.stringify(p.tool_args))}</div>
             </div>
             <button class="btn-try-preset" data-preset-id="${escapeHtml(p.id)}">
-              <span>Run Live Threat Test</span> âž”
+              <span>Run Live Threat Test</span> Ã¢Å¾â€
             </button>`;
           card.querySelector('button').addEventListener('click', () => runPreset(p.id));
           grid.appendChild(card);
@@ -2111,7 +2158,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             <td>${escapeHtml(doc.content)}</td>
             <td><span class="tag pass">${(doc.quality_score * 100).toFixed(0)}%</span></td>
             <td style="text-align: center;">
-              <button style="background:transparent; border:none; color:#F87171; cursor:pointer;" onclick="deleteFact(${doc.id})">ðŸ—‘ï¸</button>
+              <button style="background:transparent; border:none; color:#F87171; cursor:pointer;" onclick="deleteFact(${doc.id})">Ã°Å¸â€”â€˜Ã¯Â¸Â</button>
             </td>`;
           tbody.appendChild(row);
         });
@@ -2183,7 +2230,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       if (data.requires_user_confirmation) {
         html += `
           <div style="background:rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.3); border-radius:6px; padding:0.6rem; color:#FDE68A; margin-bottom:0.75rem;">
-            âš ï¸ <strong>Human-in-the-Loop Confirmation Required:</strong> This tool performs a sensitive/mutating operation.
+            Ã¢Å¡Â Ã¯Â¸Â <strong>Human-in-the-Loop Confirmation Required:</strong> This tool performs a sensitive/mutating operation.
           </div>`;
       }
 

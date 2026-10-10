@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional, Union
 import urllib.request
 import urllib.error
@@ -153,6 +154,17 @@ class OllamaModelAdapter(ModelAdapter):
             "temperature": kwargs.get("temperature", self.temperature),
         }
         num_predict = kwargs.get("num_predict", self.num_predict)
+        user_input = str(kwargs.get("user_input", ""))
+        if (
+            num_predict is not None
+            and num_predict == self.num_predict
+            and re.search(
+                r"\b(detailed|in depth|in detail|comprehensive|step[- ]by[- ]step|long explanation|elaborate)\b",
+                user_input,
+                re.IGNORECASE,
+            )
+        ):
+            num_predict = max(num_predict, 192)
         if num_predict is not None:
             options["num_predict"] = num_predict
 
@@ -199,6 +211,8 @@ class OllamaModelAdapter(ModelAdapter):
 
 
 class LocalOpenAICompatibleAdapter(ModelAdapter):
+    provider_label = "OpenAI-compatible"
+
     def __init__(
         self,
         base_url: str = "http://localhost:8000/v1",
@@ -206,12 +220,16 @@ class LocalOpenAICompatibleAdapter(ModelAdapter):
         api_key: str = "not-needed",
         temperature: float = 0.7,
         timeout: int = 60,
+        max_tokens: Optional[int] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
         self.api_key = api_key
         self.temperature = temperature
         self.timeout = timeout
+        self.max_tokens = max_tokens
+        self.extra_body = extra_body or {}
 
     def generate(self, prompt: str, **kwargs: Any) -> str:
         url = f"{self.base_url}/chat/completions"
@@ -220,6 +238,10 @@ class LocalOpenAICompatibleAdapter(ModelAdapter):
             "messages": [{"role": "user", "content": prompt}],
             "temperature": kwargs.get("temperature", self.temperature),
         }
+        max_tokens = kwargs.get("max_tokens", self.max_tokens)
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        payload.update(self.extra_body)
         data = json.dumps(payload).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -231,7 +253,15 @@ class LocalOpenAICompatibleAdapter(ModelAdapter):
                 res_json = json.loads(resp.read().decode("utf-8"))
                 choices = res_json.get("choices", [])
                 if choices:
-                    return choices[0].get("message", {}).get("content", "")
+                    message = choices[0].get("message", {})
+                    content = message.get("content", "")
+                    if not content and any(
+                        message.get(key) for key in ("reasoning_content", "reasoning")
+                    ):
+                        raise RuntimeError(
+                            "Provider returned reasoning without a final answer."
+                        )
+                    return content if isinstance(content, str) else ""
                 return ""
         except urllib.error.URLError as e:
             raise RuntimeError(f"Failed to connect to Local LLM server at {url}: {str(e)}")

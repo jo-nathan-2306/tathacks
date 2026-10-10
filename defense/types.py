@@ -21,8 +21,6 @@ class ClaimStatus(Enum):
     CONTRADICTED = "CONTRADICTED"
     INSUFFICIENT = "INSUFFICIENT"
     UNVERIFIABLE = "UNVERIFIABLE"
-
-
 class ClaimType(Enum):
     NUMERICAL = "NUMERICAL"
     TEMPORAL = "TEMPORAL"
@@ -30,8 +28,6 @@ class ClaimType(Enum):
     GENERAL_FACT = "GENERAL_FACT"
     OPINION = "OPINION"
     CREATIVE = "CREATIVE"
-
-
 class TrustBoundaryType(Enum):
     SYSTEM = "SYSTEM"
     DEVELOPER = "DEVELOPER"
@@ -39,8 +35,6 @@ class TrustBoundaryType(Enum):
     RETRIEVED_DOC = "RETRIEVED_DOC"
     MEMORY = "MEMORY"
     TOOL_OUTPUT = "TOOL_OUTPUT"
-
-
 class ActionType(Enum):
     PASS = "PASS"
     QUALIFY = "QUALIFY"

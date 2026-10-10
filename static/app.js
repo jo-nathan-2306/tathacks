@@ -23,6 +23,7 @@
   const chatSearchCount = document.getElementById('chatSearchCount');
   const webGroundingControl = document.getElementById('webGroundingControl');
   const webSearchToggle = document.getElementById('webSearchToggle');
+  const chatHistoryToggle = document.getElementById('chatHistoryToggle');
 
   // Keep the transcript in memory only. Chat prompts are not written to browser storage.
   let transcript = [];
@@ -47,7 +48,7 @@
     const head = document.createElement('div');
     head.className = 'message-head';
     const name = document.createElement('span');
-    name.textContent = role === 'assistant' ? 'AegisGuard' : 'You';
+    name.textContent = role === 'assistant' ? 'Karlos' : 'You';
     const time = document.createElement('time');
     time.className = 'message-time';
     time.textContent = timeLabel();
@@ -57,6 +58,13 @@
     body.className = 'message-text';
     body.textContent = text;
     content.append(head, body);
+
+    if (result?.action === 'WITHHOLD' && Array.isArray(result.errors) && result.errors.length) {
+      const error = document.createElement('div');
+      error.className = 'error-note';
+      error.textContent = `Generation issue: ${result.errors[0]}`;
+      content.append(error);
+    }
 
     if (result) {
       const chips = document.createElement('div');
@@ -132,7 +140,7 @@
       addAuditLine(auditBody, 'Auditing', `${Number(result.latency_ms || 0).toFixed(0)} ms · ${result.retry_count || 0} retry(s)`);
       if (result.provider_error) addAuditLine(auditBody, 'Search / review detail', result.provider_error);
       if (action === 'WITHHOLD' && result.errors?.length) {
-        addAuditLine(auditBody, 'Generation status', 'The provider failed; AegisGuard returned its safe fallback.');
+        addAuditLine(auditBody, 'Generation error', result.errors.join(' · '));
       }
       if ((result.assertions || []).length) {
         const claims = document.createElement('ul');
@@ -222,9 +230,9 @@
 
   function exportChat() {
     if (!transcript.length) return;
-    const lines = ['# AegisGuard chat', '', `Exported ${new Date().toLocaleString()}`, ''];
+    const lines = ['# Karlos chat', '', `Exported ${new Date().toLocaleString()}`, ''];
     transcript.forEach(turn => {
-      lines.push(`## ${turn.role === 'user' ? 'You' : 'AegisGuard'}`, '', turn.text, '');
+      lines.push(`## ${turn.role === 'user' ? 'You' : 'Karlos'}`, '', turn.text, '');
       if (turn.role === 'assistant' && Array.isArray(turn.sources) && turn.sources.length) {
         lines.push('Sources:');
         turn.sources.forEach(source => {
@@ -239,7 +247,7 @@
     const downloadUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = downloadUrl;
-    link.download = `aegisguard-chat-${new Date().toISOString().slice(0, 10)}.md`;
+    link.download = `karlos-chat-${new Date().toISOString().slice(0, 10)}.md`;
     document.body.append(link);
     link.click();
     link.remove();
@@ -250,9 +258,19 @@
     const article = addMessage('assistant', '');
     article.classList.add('typing-message');
     const body = article.querySelector('.message-text');
-    body.setAttribute('aria-label', 'AegisGuard is checking your message');
-    body.innerHTML = '<span class="typing-indicator" aria-hidden="true"><i></i><i></i><i></i></span>';
+    body.setAttribute('aria-label', 'Karlos is checking your message');
+    body.innerHTML = '<span class="typing-indicator" aria-hidden="true"><i></i><i></i><i></i></span><span class="thinking-status">Preparing a protected response · 0s</span>';
+    const startedAt = Date.now();
+    const status = body.querySelector('.thinking-status');
+    article.statusTimer = window.setInterval(() => {
+      status.textContent = `Preparing a protected response · ${Math.floor((Date.now() - startedAt) / 1000)}s`;
+    }, 1000);
     return article;
+  }
+
+  function removeTyping(article) {
+    if (article?.statusTimer) window.clearInterval(article.statusTimer);
+    article?.remove();
   }
 
   function resizeInput() {
@@ -275,7 +293,9 @@
     const loading = addTyping();
 
     try {
-      const memoryTurns = options.memoryContext ?? transcript.slice(0, -1).slice(-6);
+      const memoryTurns = chatHistoryToggle.checked
+        ? (options.memoryContext ?? transcript.slice(0, -1).slice(-6))
+        : [];
       const memory = memoryTurns.map(turn => `${turn.role === 'user' ? 'User' : 'Assistant'}: ${turn.text}`);
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -283,7 +303,7 @@
         body: JSON.stringify({ message: text, memory_context: memory.length ? memory : undefined, web_search_enabled: webSearchToggle.checked })
       });
       const data = await response.json().catch(() => ({}));
-      loading.remove();
+      removeTyping(loading);
       if (!response.ok) {
         const detail = typeof data.detail === 'string' ? data.detail : `Chat request failed (${response.status}).`;
         addError(detail);
@@ -294,9 +314,10 @@
       syncExportButton();
       addMessage('assistant', answer, data, text);
     } catch (error) {
-      loading.remove();
-      addError('Could not reach the AegisGuard server. Check that the website server is running and try again.');
+      removeTyping(loading);
+      addError('Could not reach the Karlos server. Check that the website server is running and try again.');
     } finally {
+      removeTyping(loading);
       sending = false;
       resizeInput();
       input.focus();
@@ -339,18 +360,25 @@
   function updateProviderFields() {
     const openAI = providerSelect.value === 'openai-compatible';
     const tinyfish = providerSelect.value === 'tinyfish' || providerSelect.value === 'tinyfish-standalone';
+    const nvidiaNim = providerSelect.value === 'nvidia-nim';
     const providerNote = document.getElementById('providerNote');
     apiKeyRow.hidden = !openAI;
     if (providerSelect.value === 'ollama') baseUrlInput.value = 'http://localhost:11434';
     else if (openAI && baseUrlInput.value === 'http://localhost:11434') baseUrlInput.value = 'https://api.openai.com/v1';
-    modelNameInput.disabled = providerSelect.value === 'demo' || tinyfish;
-    baseUrlInput.disabled = providerSelect.value === 'demo' || tinyfish;
-    providerNote.hidden = !tinyfish;
+    else if (nvidiaNim) {
+      modelNameInput.value = 'nvidia/nemotron-3.5-lightning-30b-a3b';
+      baseUrlInput.value = 'https://integrate.api.nvidia.com/v1';
+    }
+    modelNameInput.disabled = providerSelect.value === 'demo' || tinyfish || nvidiaNim;
+    baseUrlInput.disabled = providerSelect.value === 'demo' || tinyfish || nvidiaNim;
+    providerNote.hidden = !tinyfish && !nvidiaNim;
     providerNote.textContent = providerSelect.value === 'tinyfish-standalone'
-      ? 'Standalone mode calls TinyFish Search only and displays its results directly. No Ollama or other chat LLM is called. A privacy-redacted query is sent to TinyFish; AegisGuard still applies its safety checks.'
+      ? 'Standalone mode calls TinyFish Search only and displays its results directly. No Ollama or other chat LLM is called. A privacy-redacted query is sent to TinyFish; Karlos still applies its safety checks.'
       : tinyfish
         ? 'The active LLM drafts an answer first. TinyFish then searches and fetches up to three public result pages; the LLM reviews the draft against quarantined page text. Source links appear in the reliability report. The TinyFish key stays on the server.'
-        : '';
+        : nvidiaNim
+          ? 'Uses the NVIDIA NIM key from the server-side .env file. The model response is held until Karlos completes its safety checks.'
+          : '';
   }
 
   async function openModelSettings() {

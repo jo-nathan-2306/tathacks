@@ -53,7 +53,7 @@ User / RAG / Memory / Tool Input
 
 ## Modules
 - `defense.trust_boundary`: Enforces strict instruction hierarchies across SYSTEM, DEVELOPER, USER, RETRIEVED_DOC, MEMORY, and TOOL_OUTPUT.
-- `defense.adversarial_detector`: Multi-variant detection engine covering instruction override, fake authority, roleplay escapes, secret extraction, deceptive framing, and encodings (Base64, Hex, ROT13, Leetspeak, Unicode homoglyphs). Distinguishes benign research / quotes from genuine attacks.
+- `defense.adversarial_detector`: Multi-variant detection engine covering instruction override, fake authority, roleplay escapes, secret extraction, and deceptive framing. One bounded, iterative normalization pipeline checks Unicode/markup variants, URL escapes, Base64, hex, ROT13, reversed text, and leetspeak before the common injection scan.
 - `defense.claim_extractor`: Extracts verifiable factual assertions and prioritizes decision-critical, numerical, and temporal statements over opinions.
 - `defense.retrieval_interface`: Abstract evidence retriever, in-memory store, and structured evidence tracker with quality, provenance, and staleness handling.
 - `defense.evidence_verifier`: Verifies extracted claims against retrieved evidence, tracking contradictions, polarities, and suggested corrections.
@@ -67,6 +67,14 @@ User / RAG / Memory / Tool Input
 - `defense.rate_limiter`: Thread-safe sliding-window rate limiter providing sustained and burst protection per client identity.
 - `defense.audit_logger`: Append-only JSONL audit trail with SHA-256 fingerprinting, event filtering, and log rotation.
 - `defense.pipeline`: Orchestrates the complete end-to-end defensive workflow.
+
+Explicit Base64 decode requests are handled as inert data: Karlos displays the
+decoded text deterministically, masks recognized secrets, and refuses to carry
+out any embedded instruction. The normalizer is bounded by pass, variant, and
+text-size limits; transformed variants are only scanned and are never promoted
+to trusted instructions. No finite normalizer can recognize every possible
+encoding or transformation, so model and tool permissions remain independently
+enforced.
 
 ## Provider-neutral integration and tool policy
 
@@ -108,6 +116,22 @@ side-effect policy in the host application as well.
 
 The pipeline includes first-class support for local inference via **Ollama** (`llama3.1` / `llama3.1:latest`), featuring auto-detection, tag resolution (e.g. `llama 3.1b` automatically resolves to `llama3.1:latest`), and connection health checks.
 
+## NVIDIA NIM (Nemotron 3.5 Lightning)
+
+The chat supports NVIDIA's OpenAI-compatible NIM endpoint with
+`nvidia/nemotron-3.5-lightning-30b-a3b`. Set `NVIDIA_API_KEY` in the ignored
+repo `.env` file; `.env.example` lists the required variable names without
+secrets. When the key is configured, NVIDIA NIM is the startup default. Other
+providers remain available from Model settings. The API key stays server-side.
+
+NIM replies use the same defensive pipeline as local Ollama and other hosted
+providers. They are held until input screening, factuality checks, and output
+safety checks complete, so the chat does not stream unchecked tokens to the
+browser. The app disables extended reasoning and applies an output guard that
+withholds explicit internal-reasoning dumps, retries once for a final answer,
+and fails closed if the provider repeats the leak. The app also requests a
+bounded answer length to keep generation responsive.
+
 ## TinyFish-backed factuality review
 
 When the combined TinyFish + LLM provider is selected, the chat follows this
@@ -138,14 +162,22 @@ python -m pip install -r requirements.txt
 python main.py --web
 ```
 
-Open **http://127.0.0.1:8000** for the client-side chat app. It uses Ollama
-when available; otherwise it starts with a mock model so the chat flow works
-without a model server. The chat keeps its transcript in browser memory for
-the current page session and sends recent turns as guarded memory context.
+Open **http://127.0.0.1:8000** for the client-side chat app. NVIDIA NIM is the
+default when `NVIDIA_API_KEY` is configured; otherwise the app uses available
+TinyFish/Ollama providers or starts with a mock model. The chat keeps its
+transcript in browser memory for the current page session; recent turns are
+sent as context only when **Share chat history** is enabled.
 Open **http://127.0.0.1:8000/console** for the full security console with
 pipeline inspection, threat presets, knowledge base, tool checks, and audit
 telemetry. The API enforces request size limits, dashboard toggles are scoped
 to each request, and untrusted text is rendered as text in the chat client.
+The chat starts with history sharing disabled; enable **Share chat history**
+when you want recent turns included in the next model request. A live timer
+shows how long a protected response has been processing. Synchronous model
+generation runs in a worker thread so slow inference does not block status and
+other web requests. Responses include a restrictive Content Security Policy,
+clickjacking protection, MIME sniffing protection, a no-referrer policy, and
+disabled camera, microphone, and location access.
 
 If port 8000 is already in use, choose another local port, for example:
 

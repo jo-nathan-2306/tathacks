@@ -185,6 +185,6 @@ class PipelineConfig:
         }
     )
     fallback_response: str = (
-        "I am unable to verify the accuracy of this claim with high confidence, "
-        "and have withheld potentially unreliable assertions."
+        "I couldn't generate a response because the configured model did not return a usable answer. "
+        "Check the provider status and try again."
     )

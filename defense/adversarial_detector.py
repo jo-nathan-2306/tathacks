@@ -1,11 +1,21 @@
 import base64
 import codecs
+import html
 import re
 import unicodedata
 import urllib.parse
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from defense.config import AdversarialConfig
 from defense.types import AdversarialDetectionResult, RiskLevel
+
+
+@dataclass
+class ObfuscationNormalization:
+    """Bounded text variants used only for screening and inert display."""
+
+    variants: List[str] = field(default_factory=list)
+    base64_payloads: List[str] = field(default_factory=list)
 
 
 class AdversarialDetector:
@@ -70,6 +80,7 @@ class AdversarialDetector:
     LEXICON_CATEGORIES = {
         "instruction_hierarchy": [
             r"ignore\s+(all\s+)?(previous|prior|above|system)\s+instructions?[^.?!]*",
+            r"ignore\s+(all\s+)?(previous\s+|prior\s+|above\s+|system\s+)?(instructions?|rules|guardrails|safety\s+rules)\b[^.?!]*",
             r"disregard\s+(all\s+)?(prior|previous|existing)\s+(rules|guidelines|directives)[^.?!]*",
             r"forget\s+(everything|all)\s+you\s+(were\s+told|know)[^.?!]*",
             r"(override\s+system\s+prompt|system\s+override\s*[:\s]?)[^.?!]*",
@@ -100,6 +111,7 @@ class AdversarialDetector:
         ],
         "secret_extraction": [
             r"(print|show|dump|reveal|output)\s+(your\s+)?(initial|system|original|developer)\s+prompt[^.?!]*",
+            r"(print|show|dump|reveal|output)\s+(your\s+)?(hidden\s+)?(system\s+)?prompt\b[^.?!]*",
             r"(print|show|dump|reveal|output)\s+(hidden\s+instructions|secrets)[^.?!]*",
             r"(print|show|dump|reveal|output)\s+(all\s+)?(admin\s+)?(keys?|tokens?|secrets?|passwords?|credentials?)[^.?!]*",
             r"what\s+are\s+your\s+internal\s+system\s+rules",
@@ -122,6 +134,8 @@ class AdversarialDetector:
 
     HIGH_SEVERITY_PATTERNS = [
         re.compile(r"ignore\s+(all\s+)?(previous|prior|above|system)\s+instructions?[^.?!]*", re.IGNORECASE),
+        re.compile(r"ignore\s+(all\s+)?(previous\s+|prior\s+|above\s+|system\s+)?(instructions?|rules|guardrails|safety\s+rules)\b[^.?!]*", re.IGNORECASE),
+        re.compile(r"(print|show|dump|reveal|output)\s+(your\s+)?(hidden\s+)?(system\s+)?prompt\b[^.?!]*", re.IGNORECASE),
         re.compile(r"disregard\s+(all\s+)?(prior|previous|existing)\s+(rules|guidelines|directives)[^.?!]*", re.IGNORECASE),
         re.compile(r"forget\s+(everything|all)\s+you\s+(were\s+told|know)[^.?!]*", re.IGNORECASE),
         re.compile(r"(override\s+system\s+prompt|system\s+override\s*[:\s]?)[^.?!]*", re.IGNORECASE),
@@ -150,7 +164,9 @@ class AdversarialDetector:
         }
 
     def normalize_text(self, text: str) -> str:
-        cleaned = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+        # Drop Unicode format controls (including zero-width and bidi controls)
+        # so visual ordering or invisible separators cannot hide token text.
+        cleaned = "".join(char for char in text if unicodedata.category(char) != "Cf")
         for h_char, repl in self.HOMOGLYPH_MAP.items():
             cleaned = cleaned.replace(h_char, repl)
 
@@ -164,16 +180,6 @@ class AdversarialDetector:
         normalized = self._strip_markup(normalized)
         return normalized
 
-    def _decode_url_encoded(self, text: str) -> str:
-        """Decode %XX URL-encoded sequences."""
-        try:
-            decoded = urllib.parse.unquote(text)
-            if decoded != text:
-                return decoded
-        except Exception:
-            pass
-        return text
-
     def _strip_markup(self, text: str) -> str:
         """Remove HTML tags and dangerous markdown injection patterns."""
         # HTML tags (specific dangerous elements first, then generic)
@@ -184,48 +190,103 @@ class AdversarialDetector:
         stripped = re.sub(r"\[[^\]]*\]\(\s*(javascript|data)\s*:[^)]*\)", "", stripped, flags=re.IGNORECASE)
         return stripped
 
-    def try_decode_obfuscated(self, text: str) -> List[str]:
-        candidates = [text]
+    def normalize_obfuscated_text(
+        self,
+        text: str,
+        *,
+        max_passes: int = 4,
+        max_variants: int = 32,
+        max_variant_chars: int = 12_000,
+    ) -> ObfuscationNormalization:
+        """Apply bounded, iterative normalization and common text decodings.
 
-        # URL-encoded payloads
-        url_decoded = self._decode_url_encoded(text)
-        if url_decoded != text:
-            candidates.append(url_decoded)
+        All outputs are screening variants only. They never become trusted
+        instructions or are sent back to a model as executable content.
+        """
+        result = ObfuscationNormalization(variants=[text[:max_variant_chars]])
+        seen = set(result.variants)
+        frontier = list(result.variants)
+        base64_payloads: Set[str] = set()
 
-        b64_pattern = re.compile(r"[A-Za-z0-9+/=]{16,}")
-        for match in b64_pattern.finditer(text):
-            try:
-                decoded = base64.b64decode(match.group(0)).decode("utf-8", errors="ignore")
-                if len(decoded) > 5 and any(c.isalnum() for c in decoded):
-                    candidates.append(decoded)
-            except Exception:
-                pass
+        def add_variant(candidate: str, *, from_base64: bool = False) -> bool:
+            candidate = candidate[:max_variant_chars]
+            if (
+                len(candidate) <= 5
+                or not any(char.isalnum() for char in candidate)
+                or not all(char.isprintable() or char in "\r\n\t" for char in candidate)
+            ):
+                return False
+            if from_base64 and len(candidate) <= 4096:
+                base64_payloads.add(candidate)
+            if candidate in seen or len(result.variants) >= max_variants:
+                return False
+            seen.add(candidate)
+            result.variants.append(candidate)
+            return True
 
-        hex_pattern = re.compile(r"\b([0-9a-fA-F]{2}\s*){8,}\b")
-        for match in hex_pattern.finditer(text):
-            try:
-                raw_hex = match.group(0).replace(" ", "")
-                decoded = bytes.fromhex(raw_hex).decode("utf-8", errors="ignore")
-                if len(decoded) > 5 and any(c.isalnum() for c in decoded):
-                    candidates.append(decoded)
-            except Exception:
-                pass
+        for _ in range(max_passes):
+            next_frontier: List[str] = []
+            for current in frontier:
+                # Canonical Unicode/markup normalization, nested HTML entities,
+                # and repeated percent decoding share one bounded pass loop.
+                normalized = self.normalize_text(current)
+                decoded_url = urllib.parse.unquote(current)
+                candidates = [normalized, html.unescape(current), decoded_url]
 
-        if len(text) > 15:
-            try:
-                rot13_candidate = codecs.decode(text, "rot_13")
-                candidates.append(rot13_candidate)
-            except Exception:
-                pass
+                # Decode textual encodings only when the bytes form readable
+                # UTF-8. Both padded and valid unpadded Base64 are accepted.
+                for match in re.finditer(
+                    r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/=]{16,}(?![A-Za-z0-9+/=])",
+                    current,
+                ):
+                    token = match.group(0)
+                    padded = token + ("=" * ((-len(token)) % 4))
+                    try:
+                        decoded = base64.b64decode(padded, validate=True).decode("utf-8", errors="strict")
+                        if len(decoded) <= 4096 and all(
+                            char.isprintable() or char in "\r\n\t" for char in decoded
+                        ):
+                            if add_variant(decoded, from_base64=True):
+                                next_frontier.append(decoded)
+                    except Exception:
+                        pass
 
-        words = text.split()
-        if len(words) > 3:
-            reversed_words = " ".join(reversed(words))
-            reversed_chars = text[::-1]
-            candidates.append(reversed_words)
-            candidates.append(reversed_chars)
+                # Hex text is decoded under the same readability and size
+                # constraints as other encoded variants.
+                for match in re.finditer(r"(?<![0-9a-fA-F])(?:[0-9a-fA-F]{2}[\s,:-]*){8,}(?![0-9a-fA-F])", current):
+                    raw_hex = re.sub(r"[\s,:-]", "", match.group(0))
+                    try:
+                        decoded = bytes.fromhex(raw_hex).decode("utf-8", errors="strict")
+                        if len(decoded) <= 4096 and all(
+                            char.isprintable() or char in "\r\n\t" for char in decoded
+                        ):
+                            if add_variant(decoded):
+                                next_frontier.append(decoded)
+                    except Exception:
+                        pass
 
-        return candidates
+                # Reversible text transforms are bounded too; the common
+                # detector scans their outputs just like decoded formats.
+                if len(current) <= max_variant_chars:
+                    candidates.append(codecs.decode(current, "rot_13"))
+                    candidates.append(current[::-1])
+                    words = current.split()
+                    if len(words) > 3:
+                        candidates.append(" ".join(reversed(words)))
+
+                for candidate in candidates:
+                    if add_variant(candidate):
+                        next_frontier.append(candidate)
+                    if len(result.variants) >= max_variants:
+                        break
+                if len(result.variants) >= max_variants:
+                    break
+            frontier = next_frontier
+            if not frontier or len(result.variants) >= max_variants:
+                break
+
+        result.base64_payloads = sorted(base64_payloads)[:3]
+        return result
 
     def is_benign_context(self, text: str) -> bool:
         if not self.config.distinguish_benign_research:
@@ -378,7 +439,10 @@ class AdversarialDetector:
         return clean_query, quarantined
 
     def detect(
-        self, input_text: str, _extract_query: bool = True
+        self,
+        input_text: str,
+        _extract_query: bool = True,
+        _normalization: Optional[ObfuscationNormalization] = None,
     ) -> AdversarialDetectionResult:
         if not self.config.enabled:
             return AdversarialDetectionResult(
@@ -393,13 +457,12 @@ class AdversarialDetector:
             )
 
         benign = self.is_benign_context(input_text)
-        text_variants = [input_text, self.normalize_text(input_text)]
-
-        if self.config.obfuscation_detection:
-            decoded_variants = self.try_decode_obfuscated(input_text)
-            for v in decoded_variants:
-                text_variants.append(v)
-                text_variants.append(self.normalize_text(v))
+        normalization = _normalization or self.normalize_obfuscated_text(input_text)
+        text_variants = (
+            normalization.variants
+            if self.config.obfuscation_detection
+            else [input_text, self.normalize_text(input_text)]
+        )
 
         detected_matches: Set[str] = set()
         category_hits: Dict[str, int] = {cat: 0 for cat in self.LEXICON_CATEGORIES}
