@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import json
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 import urllib.request
 import urllib.error
 
@@ -44,12 +44,18 @@ class OllamaModelAdapter(ModelAdapter):
         temperature: float = 0.7,
         timeout: int = 120,
         auto_resolve_model: bool = True,
+        num_predict: Optional[int] = None,
+        keep_alive: Optional[Union[str, int]] = None,
     ) -> None:
         self.raw_model_name = model_name
         self.base_url = base_url.rstrip("/")
         self.temperature = temperature
         self.timeout = timeout
         self.auto_resolve_model = auto_resolve_model
+        if num_predict is not None and num_predict <= 0:
+            raise ValueError("num_predict must be a positive integer")
+        self.num_predict = num_predict
+        self.keep_alive = keep_alive
         self.model_name = (
             self.resolve_model_name(model_name)
             if auto_resolve_model
@@ -143,14 +149,22 @@ class OllamaModelAdapter(ModelAdapter):
         if self.auto_resolve_model and target_model != self.model_name:
             target_model = self.resolve_model_name(target_model)
 
+        options = {
+            "temperature": kwargs.get("temperature", self.temperature),
+        }
+        num_predict = kwargs.get("num_predict", self.num_predict)
+        if num_predict is not None:
+            options["num_predict"] = num_predict
+
         payload = {
             "model": target_model,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": kwargs.get("temperature", self.temperature),
-            },
+            "options": options,
         }
+        keep_alive = kwargs.get("keep_alive", self.keep_alive)
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url,

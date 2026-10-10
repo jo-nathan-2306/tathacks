@@ -2,6 +2,7 @@ import base64
 import codecs
 import re
 import unicodedata
+import urllib.parse
 from typing import Any, Dict, List, Optional, Set, Tuple
 from defense.config import AdversarialConfig
 from defense.types import AdversarialDetectionResult, RiskLevel
@@ -22,6 +23,21 @@ class AdversarialDetector:
         "\u03b1": "a",
         "\u03bf": "o",
         "\u03c1": "p",
+        # Expanded coverage
+        "\u03bd": "v",
+        "\u03a4": "T",
+        "\u0392": "B",
+        "\u043d": "h",
+        "\u043c": "m",
+        "\u0442": "t",
+        "\u044c": "b",
+        "\u0501": "d",
+        "\u0261": "g",
+        "\u217c": "l",
+        "\u0456": "i",
+        "\u0410": "A",
+        "\u0415": "E",
+        "\u041e": "O",
     }
 
     LEET_MAP = {
@@ -85,6 +101,7 @@ class AdversarialDetector:
         "secret_extraction": [
             r"(print|show|dump|reveal|output)\s+(your\s+)?(initial|system|original|developer)\s+prompt[^.?!]*",
             r"(print|show|dump|reveal|output)\s+(hidden\s+instructions|secrets)[^.?!]*",
+            r"(print|show|dump|reveal|output)\s+(all\s+)?(admin\s+)?(keys?|tokens?|secrets?|passwords?|credentials?)[^.?!]*",
             r"what\s+are\s+your\s+internal\s+system\s+rules",
             r"dump\s+the\s+context\s+window",
             r"show\s+secret\s+keys?",
@@ -142,10 +159,39 @@ class AdversarialDetector:
 
         for char, repl in self.LEET_MAP.items():
             normalized = normalized.replace(char, repl)
+
+        # Strip HTML tags and markdown injection patterns
+        normalized = self._strip_markup(normalized)
         return normalized
+
+    def _decode_url_encoded(self, text: str) -> str:
+        """Decode %XX URL-encoded sequences."""
+        try:
+            decoded = urllib.parse.unquote(text)
+            if decoded != text:
+                return decoded
+        except Exception:
+            pass
+        return text
+
+    def _strip_markup(self, text: str) -> str:
+        """Remove HTML tags and dangerous markdown injection patterns."""
+        # HTML tags (specific dangerous elements first, then generic)
+        stripped = re.sub(r"<\s*\/?\s*(script|img|iframe|object|embed|link|meta|style)[^>]*>", "", text, flags=re.IGNORECASE)
+        stripped = re.sub(r"<[^>]{0,500}>", "", stripped, flags=re.IGNORECASE)
+        # Markdown image/link injections with javascript: or data: URIs
+        stripped = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", stripped)
+        stripped = re.sub(r"\[[^\]]*\]\(\s*(javascript|data)\s*:[^)]*\)", "", stripped, flags=re.IGNORECASE)
+        return stripped
 
     def try_decode_obfuscated(self, text: str) -> List[str]:
         candidates = [text]
+
+        # URL-encoded payloads
+        url_decoded = self._decode_url_encoded(text)
+        if url_decoded != text:
+            candidates.append(url_decoded)
+
         b64_pattern = re.compile(r"[A-Za-z0-9+/=]{16,}")
         for match in b64_pattern.finditer(text):
             try:

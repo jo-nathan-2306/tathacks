@@ -6,7 +6,11 @@ CLI entry point for testing and running the Defensive Safety Pipeline with Ollam
 import argparse
 import sys
 import time
+from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from defense.pipeline import DefensivePipeline
 from defense.retrieval_interface import Evidence, InMemoryRetriever
@@ -312,8 +316,30 @@ def main():
         action="store_true",
         help="Run 6 automated safety, jailbreak, and hallucination scenarios",
     )
+    parser.add_argument(
+        "--web",
+        "-w",
+        action="store_true",
+        help="Launch the interactive AegisGuard AI Defense Web Console",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port for the web console (default: 8000)",
+    )
 
     args = parser.parse_args()
+
+    if args.web:
+        if not 1 <= args.port <= 65535:
+            parser.error("--port must be between 1 and 65535")
+        import uvicorn
+        from web_app import app
+        print_banner()
+        print(f"[+] Launching AegisGuard AI Defense Web Console on http://127.0.0.1:{args.port} ...")
+        uvicorn.run(app, host="127.0.0.1", port=args.port)
+        return
 
     print_banner()
 

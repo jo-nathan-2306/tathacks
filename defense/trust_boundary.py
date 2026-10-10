@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional
 from defense.types import TrustBoundaryType
 
@@ -29,6 +30,10 @@ class TrustBoundaryManager:
         re.compile(r"reply\s+(only\s+)?with\s+(the\s+)?(exact\s+)?(word|phrase|token|code|canary)", re.IGNORECASE),
         re.compile(r"canary-[a-zA-Z0-9_-]+", re.IGNORECASE),
     ]
+    STRUCTURAL_MARKER = re.compile(
+        r"(?im)^\s*#{1,6}\s*\[(?:TRUSTED|UNTRUSTED|USER INPUT|SYSTEM|DEVELOPER)[^\]\r\n]*\]"
+    )
+    ROLE_LABEL = re.compile(r"(?im)^\s*(?:system|assistant|developer)\s*:")
 
     def __init__(self) -> None:
         pass
@@ -42,7 +47,14 @@ class TrustBoundaryManager:
         if source_type in (TrustBoundaryType.SYSTEM, TrustBoundaryType.DEVELOPER):
             return text
 
-        sanitized = text
+        normalized = unicodedata.normalize("NFKC", str(text))
+        sanitized = "".join(
+            char for char in normalized
+            if unicodedata.category(char) != "Cf"
+            and (unicodedata.category(char) != "Cc" or char in "\n\r\t")
+        )
+        sanitized = self.STRUCTURAL_MARKER.sub("[FILTERED_BOUNDARY_MARKER]", sanitized)
+        sanitized = self.ROLE_LABEL.sub("[FILTERED_ROLE_LABEL]", sanitized)
         for pattern in self.OVERRIDE_INJECTION_PATTERNS:
             sanitized = pattern.sub("[FILTERED_INSTRUCTION_OVERRIDE]", sanitized)
 
